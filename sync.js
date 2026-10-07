@@ -214,15 +214,47 @@ function syncSelectedRowToBacklog(customConfig, customUserEmailMap) {
   const maxCol = Math.max(...Object.values(config.COLUMNS));
   const rowValues = sheet.getRange(rowIndex, 1, 1, maxCol).getValues()[0];
 
-  const summary = String(rowValues[config.COLUMNS.TASK - 1] || '').trim(); // Column B
+  const taskCell = sheet.getRange(rowIndex, config.COLUMNS.TASK);
+  const rawTaskText = String(rowValues[config.COLUMNS.TASK - 1] || '').trim(); // Column B
   const assigneeName = String(rowValues[config.COLUMNS.ASSIGNED_TO - 1] || '').trim(); // Column C
   const startDateRaw = rowValues[config.COLUMNS.START_DATE - 1]; // Column E
   const endDateRaw = rowValues[config.COLUMNS.END_DATE - 1]; // Column F
 
   // 3. Validation: Check if row is empty or a section header (e.g. "Backend Development")
-  if (!summary) {
+  if (!rawTaskText) {
     ui.alert('Empty Task', 'The selected row does not have a task title in Column B.', ui.ButtonSet.OK);
     return;
+  }
+
+  // Extract link(s) from Column B (both plain-text https:// and rich text hyperlinks)
+  const urlRegex = /https?:\/\/[^\s]+/gi;
+  const plainTextUrls = (rawTaskText.match(urlRegex) || []).map(u => u.replace(/[.,;:)]+$/, ''));
+
+  const richTextUrls = [];
+  try {
+    const richText = taskCell.getRichTextValue();
+    if (richText) {
+      const cellLink = richText.getLinkUrl();
+      if (cellLink) richTextUrls.push(cellLink);
+      const runs = richText.getRuns();
+      if (runs) {
+        runs.forEach(run => {
+          const runUrl = run.getLinkUrl();
+          if (runUrl) richTextUrls.push(runUrl);
+        });
+      }
+    }
+  } catch (e) {
+    Logger.log('Could not read rich text link: ' + e.message);
+  }
+
+  // Deduplicate extracted URLs preserving order
+  const extractedLinks = Array.from(new Set([...plainTextUrls, ...richTextUrls]));
+
+  // Clean summary by removing URLs so issue title is neat; fallback to raw text if only URL was provided
+  let summary = rawTaskText.replace(urlRegex, '').trim().replace(/\s{2,}/g, ' ');
+  if (!summary) {
+    summary = rawTaskText;
   }
 
   if (!assigneeName && !startDateRaw && !endDateRaw) {
@@ -267,6 +299,11 @@ function syncSelectedRowToBacklog(customConfig, customUserEmailMap) {
       priorityId: config.PRIORITY_ID
     };
 
+    // If a link was found in Column B, add that link alone to Backlog issue description
+    if (extractedLinks.length > 0) {
+      payload.description = extractedLinks.join('\n');
+    }
+
     if (assigneeId) payload.assigneeId = assigneeId;
     if (startDate) payload.startDate = startDate;
     if (dueDate) payload.dueDate = dueDate;
@@ -284,9 +321,12 @@ function syncSelectedRowToBacklog(customConfig, customUserEmailMap) {
       5
     );
 
+    const descInfo = extractedLinks.length > 0 ? `\nDescription Link: ${extractedLinks.join('\n')}` : '';
+    const assigneeInfo = assigneeName ? `\nAssignee: ${assigneeId ? assigneeName : 'Unassigned (not matched)'}` : '';
+
     ui.alert(
       'Issue Created Successfully',
-      `Backlog Issue: ${createdIssue.issueKey}\nSummary: ${summary}\n\nURL: ${issueUrl}`,
+      `Backlog Issue: ${createdIssue.issueKey}\nSummary: ${summary}${descInfo}${assigneeInfo}\n\nURL: ${issueUrl}`,
       ui.ButtonSet.OK
     );
 
