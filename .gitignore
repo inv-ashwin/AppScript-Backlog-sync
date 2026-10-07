@@ -1,0 +1,6 @@
+# Sensitive credentials and local configuration
+config.js
+
+# Temporary files & logs
+*.log
+.DS_Store
