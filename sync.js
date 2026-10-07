@@ -245,19 +245,12 @@ function syncSelectedRowToBacklog(customConfig, customUserEmailMap) {
 
     const issueTypeId = getBacklogIssueTypeId(project.id, config.DEFAULT_ISSUE_TYPE, config);
 
-    // 5. Resolve Assignee ID via email mapping
+    // 5. Resolve Assignee ID via email mapping (proceed without assignee if not matched)
     let assigneeId = null;
     if (assigneeName) {
       assigneeId = resolveAssigneeId(project.id, assigneeName, config, userEmailMap);
       if (!assigneeId) {
-        const proceed = ui.alert(
-          'Assignee Not Found',
-          `Could not match "${assigneeName}" to any project member in Backlog.\n\nWould you like to create the task without an assignee?`,
-          ui.ButtonSet.YES_NO
-        );
-        if (proceed !== ui.Button.YES) {
-          return;
-        }
+        Logger.log(`Notice: Assignee "${assigneeName}" could not be matched to a Backlog user. Creating task without assignee.`);
       }
     }
 
@@ -386,13 +379,26 @@ function resolveAssigneeId(projectId, assigneeName, config, userEmailMap) {
   const effectiveConfig = config || getEffectiveConfig_();
   const effectiveEmailMap = userEmailMap || getEffectiveUserEmailMap_();
 
-  const targetEmail = effectiveEmailMap[assigneeName] ? effectiveEmailMap[assigneeName].toLowerCase().trim() : null;
+  const trimmedName = String(assigneeName).trim();
+  const cleanName = trimmedName.toLowerCase();
+
+  // Look up in email map (case-insensitive key lookup)
+  let targetEmail = null;
+  if (effectiveEmailMap[trimmedName]) {
+    targetEmail = effectiveEmailMap[trimmedName].toLowerCase().trim();
+  } else {
+    const matchedKey = Object.keys(effectiveEmailMap).find(k => k.trim().toLowerCase() === cleanName);
+    if (matchedKey) {
+      targetEmail = effectiveEmailMap[matchedKey].toLowerCase().trim();
+    }
+  }
 
   const url = `${getBaseUrl(effectiveConfig)}/api/v2/projects/${projectId}/users?apiKey=${encodeURIComponent(String(effectiveConfig.API_KEY || '').trim())}`;
   const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
 
   if (response.getResponseCode() !== 200) {
-    throw new Error(`Failed to fetch project users: ${response.getContentText()}`);
+    Logger.log(`Warning: Failed to fetch project users: ${response.getContentText()}`);
+    return null;
   }
 
   const users = JSON.parse(response.getContentText());
@@ -403,14 +409,22 @@ function resolveAssigneeId(projectId, assigneeName, config, userEmailMap) {
     if (matchedUser) return matchedUser.id;
   }
 
-  // 2. Fallback: Try matching directly by user name or userId in Backlog
-  const cleanName = assigneeName.toLowerCase();
+  // 2. Try exact match by Backlog user name or userId
   const matchedByName = users.find(u => 
-    (u.name && u.name.toLowerCase() === cleanName) ||
-    (u.userId && u.userId.toLowerCase() === cleanName)
+    (u.name && u.name.trim().toLowerCase() === cleanName) ||
+    (u.userId && u.userId.trim().toLowerCase() === cleanName)
   );
+  if (matchedByName) return matchedByName.id;
 
-  return matchedByName ? matchedByName.id : null;
+  // 3. Fallback: match by first name or word boundary (e.g. "Shinoj" matching "Shinoj Kumar")
+  const matchedPartial = users.find(u => {
+    if (!u.name) return false;
+    const nameParts = u.name.trim().toLowerCase().split(/\s+/);
+    return nameParts.includes(cleanName) || u.name.trim().toLowerCase().startsWith(cleanName);
+  });
+  if (matchedPartial) return matchedPartial.id;
+
+  return null;
 }
 
 /**
