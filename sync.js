@@ -15,33 +15,24 @@
  * - Normal Priority (ID: 3)
  * - Backlog REST API v2 using application/x-www-form-urlencoded
  * - Does NOT write anything back to the sheet; notifies via Toast & Alert popup
+ * - Can be used as a standalone Apps Script file (with config.js) OR as an Apps Script Library!
  */
 
 // ============================================================================
-// CONFIGURATION
+// DEFAULT CONFIGURATION & LIBRARY STATE
 // ============================================================================
-const CONFIG = {
-  // Your Backlog domain (e.g. "yourcompany.backlog.com" or "yourcompany.backlog.jp")
-  // You can include or omit "https://"
-  SPACE_DOMAIN: "team-o.backlog.com",
 
-  // API Key generated in Backlog: Personal Settings > API > Register New API Key
-  API_KEY: "cBZwHKPSKQE0aHTXPorHez9uITRMnhyqSpw1R5PncJatd6XbONSqj5IZol5xtRUX",
-
-  // Your Backlog Project Key (e.g. "IZ" or "PROJ")
-  PROJECT_KEY: "TEAMO",
-
-  // Default Issue Type Name (e.g. "Task" or null to use the first issue type in the project)
-  DEFAULT_ISSUE_TYPE: "Task",
-
-  // Priority ID: 2 = High, 3 = Normal, 4 = Low
+/**
+ * Default fallback configuration.
+ * User-provided CONFIG in config.js or library arguments will override these values.
+ */
+const DEFAULT_CONFIG = {
+  SPACE_DOMAIN: '',
+  API_KEY: '',
+  PROJECT_KEY: '',
+  DEFAULT_ISSUE_TYPE: 'Task',
   PRIORITY_ID: 3,
-
-  // Row index where table headers are located (data starts below this row)
   HEADER_ROW_INDEX: 5,
-
-  // Column numbers (1-indexed):
-  // Col A = 1 (empty), Col B = 2, Col C = 3, Col D = 4, Col E = 5, Col F = 6
   COLUMNS: {
     TASK: 2,         // Column B (Task Summary / Issue Title)
     ASSIGNED_TO: 3,  // Column C (Assignee Name)
@@ -51,28 +42,124 @@ const CONFIG = {
 };
 
 /**
- * Mapping of Assignee Name (as shown in the sheet) to their Backlog Email Address.
- * Add all team members here.
+ * In-memory active configuration and user email map (for library consumers).
  */
-const USER_EMAIL_MAP = {
-  "Ashwin Sanalkumar": "imask0110@gmail.com",
-  // "John Doe": "john.doe@yourcompany.com",
-  // "Jane Smith": "jane.smith@yourcompany.com",
-};
+let _activeConfig = null;
+let _activeUserEmailMap = null;
+
+/**
+ * Explicitly sets the configuration and user email map for library consumers.
+ * 
+ * @param {Object} config - Backlog configuration object
+ * @param {Object} [userEmailMap] - Mapping of assignee names to emails
+ */
+function setConfig(config, userEmailMap) {
+  _activeConfig = config || null;
+  if (userEmailMap !== undefined) {
+    _activeUserEmailMap = userEmailMap;
+  }
+}
+
+/**
+ * Resolves the merged configuration by combining DEFAULT_CONFIG with:
+ * 1. Explicitly passed customConfig
+ * 2. Pre-set _activeConfig (via setConfig)
+ * 3. Globally declared CONFIG (from config.js)
+ * 
+ * @param {Object} [customConfig]
+ * @return {Object} Merged configuration object
+ */
+function getEffectiveConfig_(customConfig) {
+  const source = customConfig || _activeConfig || (typeof CONFIG !== 'undefined' ? CONFIG : null);
+  if (!source) {
+    throw new Error(
+      'Configuration not found. Please provide a CONFIG object, define it in config.js, or call setConfig().'
+    );
+  }
+
+  return {
+    ...DEFAULT_CONFIG,
+    ...source,
+    COLUMNS: {
+      ...DEFAULT_CONFIG.COLUMNS,
+      ...(source.COLUMNS || {})
+    }
+  };
+}
+
+/**
+ * Resolves the user email mapping from:
+ * 1. Explicitly passed customUserEmailMap
+ * 2. Pre-set _activeUserEmailMap (via setConfig)
+ * 3. Globally declared USER_EMAIL_MAP (from config.js)
+ * 
+ * @param {Object} [customUserEmailMap]
+ * @return {Object}
+ */
+function getEffectiveUserEmailMap_(customUserEmailMap) {
+  if (customUserEmailMap) return customUserEmailMap;
+  if (_activeUserEmailMap) return _activeUserEmailMap;
+  if (typeof USER_EMAIL_MAP !== 'undefined') return USER_EMAIL_MAP;
+  return {};
+}
+
+/**
+ * Utility to load configuration stored in Apps Script Script Properties.
+ * Useful for keeping credentials out of code entirely (File > Project Settings > Script Properties).
+ * 
+ * Supported properties:
+ * - BACKLOG_SPACE_DOMAIN
+ * - BACKLOG_API_KEY
+ * - BACKLOG_PROJECT_KEY
+ * - BACKLOG_DEFAULT_ISSUE_TYPE (optional)
+ * - BACKLOG_PRIORITY_ID (optional)
+ * - BACKLOG_HEADER_ROW_INDEX (optional)
+ * - BACKLOG_USER_EMAIL_MAP (optional JSON string)
+ * 
+ * @return {{ config: Object, userEmailMap: Object }}
+ */
+function loadConfigFromScriptProperties() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const config = {
+    SPACE_DOMAIN: props.BACKLOG_SPACE_DOMAIN || '',
+    API_KEY: props.BACKLOG_API_KEY || '',
+    PROJECT_KEY: props.BACKLOG_PROJECT_KEY || '',
+    DEFAULT_ISSUE_TYPE: props.BACKLOG_DEFAULT_ISSUE_TYPE || DEFAULT_CONFIG.DEFAULT_ISSUE_TYPE,
+    PRIORITY_ID: props.BACKLOG_PRIORITY_ID ? Number(props.BACKLOG_PRIORITY_ID) : DEFAULT_CONFIG.PRIORITY_ID,
+    HEADER_ROW_INDEX: props.BACKLOG_HEADER_ROW_INDEX ? Number(props.BACKLOG_HEADER_ROW_INDEX) : DEFAULT_CONFIG.HEADER_ROW_INDEX,
+    COLUMNS: props.BACKLOG_COLUMNS ? JSON.parse(props.BACKLOG_COLUMNS) : DEFAULT_CONFIG.COLUMNS
+  };
+
+  let userEmailMap = {};
+  if (props.BACKLOG_USER_EMAIL_MAP) {
+    try {
+      userEmailMap = JSON.parse(props.BACKLOG_USER_EMAIL_MAP);
+    } catch (e) {
+      Logger.log('Warning: Failed to parse BACKLOG_USER_EMAIL_MAP from script properties: ' + e.message);
+    }
+  }
+
+  return { config, userEmailMap };
+}
 
 // ============================================================================
-// MENU TRIGGER
+// MENU HELPER
 // ============================================================================
 
 /**
- * Automatically creates the custom menu when opening the Google Sheet.
+ * Creates the custom menu in Google Sheets.
+ * Call this from your spreadsheet's onOpen() trigger.
+ * 
+ * @param {string} [menuTitle='Backlog Sync'] Menu title to show in Google Sheets
+ * @param {string} [functionName='syncSelectedRowToBacklog'] Target function name to run on click in the client sheet
  */
-function onOpen() {
+function createMenu(menuTitle = 'Backlog Sync', functionName = 'syncSelectedRowToBacklog') {
   SpreadsheetApp.getUi()
-    .createMenu('Backlog Sync')
-    .addItem('Sync Selected Row', 'syncSelectedRowToBacklog')
+    .createMenu(menuTitle)
+    .addItem('Sync Selected Row', functionName)
     .addToUi();
 }
+
 
 // ============================================================================
 // MAIN SYNC FUNCTION
@@ -80,31 +167,57 @@ function onOpen() {
 
 /**
  * Reads the currently selected row and creates an issue in Backlog.
+ * Can be called with no arguments (uses config.js) or with custom configuration.
+ * 
+ * @param {Object} [customConfig] - Optional configuration object
+ * @param {Object} [customUserEmailMap] - Optional assignee-to-email mapping object
  */
-function syncSelectedRowToBacklog() {
+function syncSelectedRowToBacklog(customConfig, customUserEmailMap) {
   const ui = SpreadsheetApp.getUi();
+
+  let config;
+  let userEmailMap;
+  try {
+    config = getEffectiveConfig_(customConfig);
+    userEmailMap = getEffectiveUserEmailMap_(customUserEmailMap);
+
+    // Validate required credentials
+    if (!config.SPACE_DOMAIN || config.SPACE_DOMAIN === 'YOUR_SPACE.backlog.com') {
+      throw new Error('Please configure a valid SPACE_DOMAIN in config.js or pass it to syncSelectedRowToBacklog().');
+    }
+    if (!config.API_KEY || config.API_KEY === 'YOUR_BACKLOG_API_KEY') {
+      throw new Error('Please configure a valid API_KEY in config.js or pass it to syncSelectedRowToBacklog().');
+    }
+    if (!config.PROJECT_KEY || config.PROJECT_KEY === 'YOUR_PROJECT_KEY') {
+      throw new Error('Please configure a valid PROJECT_KEY in config.js or pass it to syncSelectedRowToBacklog().');
+    }
+  } catch (err) {
+    ui.alert('Configuration Error', err.message, ui.ButtonSet.OK);
+    return;
+  }
+
   const sheet = SpreadsheetApp.getActiveSheet();
   const activeCell = sheet.getActiveCell();
   const rowIndex = activeCell.getRow();
 
   // 1. Validation: Prevent running on header or title rows
-  if (rowIndex <= CONFIG.HEADER_ROW_INDEX) {
+  if (rowIndex <= config.HEADER_ROW_INDEX) {
     ui.alert(
       'Invalid Selection',
-      `Please select a valid task row below row ${CONFIG.HEADER_ROW_INDEX}.`,
+      `Please select a valid task row below row ${config.HEADER_ROW_INDEX}.`,
       ui.ButtonSet.OK
     );
     return;
   }
 
   // 2. Read row data from Columns B to F
-  const maxCol = Math.max(...Object.values(CONFIG.COLUMNS));
+  const maxCol = Math.max(...Object.values(config.COLUMNS));
   const rowValues = sheet.getRange(rowIndex, 1, 1, maxCol).getValues()[0];
 
-  const summary = String(rowValues[CONFIG.COLUMNS.TASK - 1] || '').trim(); // Column B
-  const assigneeName = String(rowValues[CONFIG.COLUMNS.ASSIGNED_TO - 1] || '').trim(); // Column C
-  const startDateRaw = rowValues[CONFIG.COLUMNS.START_DATE - 1]; // Column E
-  const endDateRaw = rowValues[CONFIG.COLUMNS.END_DATE - 1]; // Column F
+  const summary = String(rowValues[config.COLUMNS.TASK - 1] || '').trim(); // Column B
+  const assigneeName = String(rowValues[config.COLUMNS.ASSIGNED_TO - 1] || '').trim(); // Column C
+  const startDateRaw = rowValues[config.COLUMNS.START_DATE - 1]; // Column E
+  const endDateRaw = rowValues[config.COLUMNS.END_DATE - 1]; // Column F
 
   // 3. Validation: Check if row is empty or a section header (e.g. "Backend Development")
   if (!summary) {
@@ -125,17 +238,17 @@ function syncSelectedRowToBacklog() {
     SpreadsheetApp.getActiveSpreadsheet().toast('Connecting to Backlog...', 'Please wait', 5);
 
     // 4. Get Project Info & Issue Type ID from Backlog
-    const project = getBacklogProject(CONFIG.PROJECT_KEY);
+    const project = getBacklogProject(config.PROJECT_KEY, config);
     if (!project || !project.id) {
-      throw new Error(`Could not find project or numeric ID for "${CONFIG.PROJECT_KEY}".`);
+      throw new Error(`Could not find project or numeric ID for "${config.PROJECT_KEY}".`);
     }
 
-    const issueTypeId = getBacklogIssueTypeId(project.id, CONFIG.DEFAULT_ISSUE_TYPE);
+    const issueTypeId = getBacklogIssueTypeId(project.id, config.DEFAULT_ISSUE_TYPE, config);
 
     // 5. Resolve Assignee ID via email mapping
     let assigneeId = null;
     if (assigneeName) {
-      assigneeId = resolveAssigneeId(project.id, assigneeName);
+      assigneeId = resolveAssigneeId(project.id, assigneeName, config, userEmailMap);
       if (!assigneeId) {
         const proceed = ui.alert(
           'Assignee Not Found',
@@ -158,7 +271,7 @@ function syncSelectedRowToBacklog() {
       projectId: project.id,
       summary: summary,
       issueTypeId: issueTypeId,
-      priorityId: CONFIG.PRIORITY_ID
+      priorityId: config.PRIORITY_ID
     };
 
     if (assigneeId) payload.assigneeId = assigneeId;
@@ -168,8 +281,8 @@ function syncSelectedRowToBacklog() {
     Logger.log('Payload to submit: ' + JSON.stringify(payload));
 
     // 8. Send POST Request to Backlog
-    const createdIssue = createBacklogIssue(payload);
-    const issueUrl = `${getBaseUrl()}/view/${createdIssue.issueKey}`;
+    const createdIssue = createBacklogIssue(payload, config);
+    const issueUrl = `${getBaseUrl(config)}/view/${createdIssue.issueKey}`;
 
     // 9. Feedback to user (does not touch or modify the sheet)
     SpreadsheetApp.getActiveSpreadsheet().toast(
@@ -196,9 +309,11 @@ function syncSelectedRowToBacklog() {
 
 /**
  * Returns clean base URL without trailing slash or protocol duplicates.
+ * @param {Object} [config]
  */
-function getBaseUrl() {
-  const cleanDomain = String(CONFIG.SPACE_DOMAIN || '')
+function getBaseUrl(config) {
+  const effectiveConfig = config || getEffectiveConfig_();
+  const cleanDomain = String(effectiveConfig.SPACE_DOMAIN || '')
     .trim()
     .replace(/^https?:\/\//i, '')
     .replace(/\/+$/, '');
@@ -207,10 +322,13 @@ function getBaseUrl() {
 
 /**
  * Fetches project details from Backlog.
+ * @param {string} projectKey
+ * @param {Object} [config]
  */
-function getBacklogProject(projectKey) {
+function getBacklogProject(projectKey, config) {
+  const effectiveConfig = config || getEffectiveConfig_();
   const cleanKey = String(projectKey || '').trim();
-  const url = `${getBaseUrl()}/api/v2/projects/${encodeURIComponent(cleanKey)}?apiKey=${encodeURIComponent(CONFIG.API_KEY.trim())}`;
+  const url = `${getBaseUrl(effectiveConfig)}/api/v2/projects/${encodeURIComponent(cleanKey)}?apiKey=${encodeURIComponent(String(effectiveConfig.API_KEY || '').trim())}`;
   const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
 
   if (response.getResponseCode() !== 200) {
@@ -228,9 +346,13 @@ function getBacklogProject(projectKey) {
 
 /**
  * Finds the issueTypeId for the given issue type name, or defaults to the first one.
+ * @param {number|string} projectId
+ * @param {string} [preferredName]
+ * @param {Object} [config]
  */
-function getBacklogIssueTypeId(projectId, preferredName) {
-  const url = `${getBaseUrl()}/api/v2/projects/${projectId}/issueTypes?apiKey=${encodeURIComponent(CONFIG.API_KEY.trim())}`;
+function getBacklogIssueTypeId(projectId, preferredName, config) {
+  const effectiveConfig = config || getEffectiveConfig_();
+  const url = `${getBaseUrl(effectiveConfig)}/api/v2/projects/${projectId}/issueTypes?apiKey=${encodeURIComponent(String(effectiveConfig.API_KEY || '').trim())}`;
   const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
 
   if (response.getResponseCode() !== 200) {
@@ -254,12 +376,19 @@ function getBacklogIssueTypeId(projectId, preferredName) {
 /**
  * Resolves the numeric assignee ID from the sheet's assignee name.
  * Looks up USER_EMAIL_MAP first, then matches against project users' mailAddress or name.
+ * @param {number|string} projectId
+ * @param {string} assigneeName
+ * @param {Object} [config]
+ * @param {Object} [userEmailMap]
  */
-function resolveAssigneeId(projectId, assigneeName) {
+function resolveAssigneeId(projectId, assigneeName, config, userEmailMap) {
   if (!assigneeName) return null;
-  const targetEmail = USER_EMAIL_MAP[assigneeName] ? USER_EMAIL_MAP[assigneeName].toLowerCase().trim() : null;
+  const effectiveConfig = config || getEffectiveConfig_();
+  const effectiveEmailMap = userEmailMap || getEffectiveUserEmailMap_();
 
-  const url = `${getBaseUrl()}/api/v2/projects/${projectId}/users?apiKey=${encodeURIComponent(CONFIG.API_KEY.trim())}`;
+  const targetEmail = effectiveEmailMap[assigneeName] ? effectiveEmailMap[assigneeName].toLowerCase().trim() : null;
+
+  const url = `${getBaseUrl(effectiveConfig)}/api/v2/projects/${projectId}/users?apiKey=${encodeURIComponent(String(effectiveConfig.API_KEY || '').trim())}`;
   const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
 
   if (response.getResponseCode() !== 200) {
@@ -287,9 +416,12 @@ function resolveAssigneeId(projectId, assigneeName) {
 /**
  * Calls Backlog API v2 to create an issue.
  * Explicitly encodes body as application/x-www-form-urlencoded to ensure Backlog receives projectId.
+ * @param {Object} payload
+ * @param {Object} [config]
  */
-function createBacklogIssue(payload) {
-  const url = `${getBaseUrl()}/api/v2/issues?apiKey=${encodeURIComponent(CONFIG.API_KEY.trim())}`;
+function createBacklogIssue(payload, config) {
+  const effectiveConfig = config || getEffectiveConfig_();
+  const url = `${getBaseUrl(effectiveConfig)}/api/v2/issues?apiKey=${encodeURIComponent(String(effectiveConfig.API_KEY || '').trim())}`;
   
   // Backlog strictly expects application/x-www-form-urlencoded query string format
   const formBody = Object.keys(payload)
@@ -343,4 +475,23 @@ function formatDate(dateVal, timeZone) {
   }
 
   return null;
+}
+
+// ============================================================================
+// EXPORTS (CommonJS / Node environment support)
+// ============================================================================
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    DEFAULT_CONFIG,
+    setConfig,
+    createMenu,
+    syncSelectedRowToBacklog,
+    getBaseUrl,
+    getBacklogProject,
+    getBacklogIssueTypeId,
+    resolveAssigneeId,
+    createBacklogIssue,
+    formatDate,
+    loadConfigFromScriptProperties
+  };
 }
